@@ -7,7 +7,8 @@ raw/ 의 HWPX 템플릿 + 엑셀 표를 읽어, 서식을 그대로 둔 채 내�
   - 제목 칸, 날짜·기관 칸(없으면 오늘 날짜)
   - "ㅇ (배경)"/"ㅇ (목적)" 한 줄 + 필요한 만큼의 "-" 부연설명 줄
   - "□ 주요 내용" 아래, 라벨이 자유로운 "ㅇ (라벨) 내용" 줄 1개 이상
-  - 표 제목, 표 본문(1열은 순번 자동, 2~5열이 채울 칸) — 데이터 행 수만큼 표 행이 늘거나 줄어듦
+  - 표 제목, 표 본문(1열은 순번 자동, 그 뒤는 엑셀의 '순번' 다음 열 전부) — 엑셀의 열 개수만큼 표 열이,
+    데이터 행 수만큼 표 행이 늘거나 줄어듦(표 전체 너비는 유지한 채 열 너비만 다시 균등하게 나눔)
   - "참고1" 아래 참고자료 제목 칸 (참고 내용이 없으면 이 문단 전체를 삭제)
 """
 import re
@@ -228,20 +229,76 @@ def render_outline(items: list, stamps: dict, spacer: str) -> str:
 
 
 def extract_table(rows: list) -> tuple:
-    """엑셀에서 표의 4칸(명칭/규모/소재지/비고 등)에 해당하는 헤더·데이터를 뽑는다.
-    '순번'이 적힌 행을 헤더로 보고(없으면 첫 행), 각 행의 마지막 4개 칸을 사용한다.
-    앞에 안내용 제목 행이나 순번 열이 있어도, 뒤에 4개 칸만 맞으면 그대로 동작한다."""
+    """엑셀에서 '순번' 열 다음에 오는 모든 열을 그대로 표 데이터로 가져온다(개수를 4개로 고정하지 않음).
+    '순번'이 적힌 행을 헤더로 보고(없으면 첫 행), 그 열의 위치를 기준으로 뒤에 오는 열을 전부 쓴다.
+    앞에 안내용 제목 행이나 순번 앞의 빈 열이 있어도 상관없다. 완전히 빈 데이터 행은 건너뛴다."""
     header_idx = 0
     for i, row in enumerate(rows):
         if "순번" in row:
             header_idx = i
             break
-    header = rows[header_idx][-4:]
-    data_rows = [row[-4:] for row in rows[header_idx + 1 : header_idx + 7]]
+    header_row = rows[header_idx]
+    seq_idx = header_row.index("순번")
+    header = list(header_row[seq_idx + 1 :])
+    while header and header[-1] == "":
+        header.pop()
+    n_cols = len(header)
+    data_rows = []
+    for row in rows[header_idx + 1 :]:
+        slice_ = row[seq_idx + 1 : seq_idx + 1 + n_cols]
+        if any(cell.strip() for cell in slice_):
+            data_rows.append(slice_)
     return header, data_rows
 
 
 MAIN_TABLE_ID = "1849124803"
+SEQ_COL_WIDTH = 4265  # 템플릿 1열(순번) 칸 너비 — 열 개수를 바꿔도 그대로 유지
+TOTAL_DATA_WIDTH = 42228  # 템플릿 표 전체 너비(46493) - 순번 칸(4265). 데이터 열들이 나눠 쓰는 폭
+LINESEG_WIDTH_MARGIN = 1021  # 템플릿에서 확인한 cellSz width와 lineseg horzsize의 고정 차이(10557-9536, 4265-3244)
+
+
+def _set_cell_width(tc_xml: str, width: int) -> str:
+    """셀 하나의 cellSz width와 안쪽 글자 줄바꿈 폭(horzsize)을 같은 너비로 맞춘다."""
+    tc_xml = re.sub(r'(<hp:cellSz width=")\d+(")', rf"\g<1>{width}\g<2>", tc_xml, count=1)
+    horzsize = max(width - LINESEG_WIDTH_MARGIN, 1)
+    tc_xml = re.sub(r'(horzsize=")\d+(")', rf"\g<1>{horzsize}\g<2>", tc_xml, count=1)
+    return tc_xml
+
+
+def adjust_table_cols(xml_text: str, target_data_cols: int) -> str:
+    """메인 표(1열 순번 + 데이터 열)의 데이터 열 개수를 target_data_cols 개로 맞춘다.
+    표 전체 너비(46493)는 그대로 두고, 데이터 열 너비(42228)만 열 개수에 맞춰 다시 균등하게 나눈다.
+    모자라면 마지막 데이터 열을 복제해 늘리고, 많으면 뒤에서부터 지운다."""
+    m = re.search(rf'<hp:tbl id="{MAIN_TABLE_ID}".*?</hp:tbl>', xml_text, re.DOTALL)
+    if m is None:
+        raise ValueError(f"표(id={MAIN_TABLE_ID})를 찾지 못함")
+    tbl_block = m.group(0)
+
+    trs = [mm.group(0) for mm in re.finditer(r"<hp:tr>.*?</hp:tr>", tbl_block, re.DOTALL)]
+    tcs_per_row = [re.findall(r"<hp:tc[ >].*?</hp:tc>", tr, re.DOTALL) for tr in trs]
+    n_existing = len(tcs_per_row[0]) - 1  # 0번째 칸은 순번
+
+    base = TOTAL_DATA_WIDTH // target_data_cols
+    remainder = TOTAL_DATA_WIDTH - base * target_data_cols
+    widths = [base] * target_data_cols
+    widths[-1] += remainder
+
+    new_trs = []
+    for tr, tcs in zip(trs, tcs_per_row):
+        seq_tc, data_tcs = tcs[0], list(tcs[1:])
+        if target_data_cols <= n_existing:
+            data_tcs = data_tcs[:target_data_cols]
+        else:
+            last = data_tcs[-1]
+            for col in range(n_existing, target_data_cols):
+                clone = re.sub(r'colAddr="\d+"', f'colAddr="{col + 1}"', last, count=1)
+                data_tcs.append(clone)
+        data_tcs = [_set_cell_width(tc, widths[i]) for i, tc in enumerate(data_tcs)]
+        new_trs.append(tr.replace("".join(tcs), seq_tc + "".join(data_tcs), 1))
+
+    new_tbl_block = re.sub(r'colCnt="\d+"', f'colCnt="{target_data_cols + 1}"', tbl_block, count=1)
+    new_tbl_block = new_tbl_block.replace("".join(trs), "".join(new_trs), 1)
+    return xml_text[: m.start()] + new_tbl_block + xml_text[m.end() :]
 
 
 def _set_row_number_cell(data_row_xml: str, number: int) -> str:
@@ -288,7 +345,7 @@ def fill_section0(xml_text: str, content: dict) -> str:
       main_items:     "□ 주요 내용" 아래에 들어갈 ㅇ/-/* 줄 목록 (라벨 자유, 1개 이상)
       각 줄은 {"depth": 1|2|3, "label": str(깊이1=ㅇ일 때만), "text": str} 형태.
       depth 1=ㅇ, 2=-, 3=*. 중간 단계를 생략해도(예: ㅇ 다음에 바로 depth 3) 순서대로 넣으면 된다.
-      table_header, table_rows: 표에 채울 데이터 (행 수만큼 표가 늘어나거나 줄어듦)
+      table_header, table_rows: 표에 채울 데이터 (열 개수·행 수 모두 데이터에 맞춰 표가 늘어나거나 줄어듦)
     """
 
     ref_title = (content.get("ref_title") or "").strip()
@@ -332,6 +389,8 @@ def fill_section0(xml_text: str, content: dict) -> str:
 
     header = content.get("table_header", [])
     data_rows = content.get("table_rows", [])
+    n_cols = len(header)
+    xml_text = adjust_table_cols(xml_text, n_cols)
     xml_text = adjust_table_rows(xml_text, len(data_rows))
 
     def fill_cell(match: "re.Match", value: str) -> str:
@@ -350,7 +409,7 @@ def fill_section0(xml_text: str, content: dict) -> str:
         if addr is None:
             return block
         col, row = int(addr.group(1)), int(addr.group(2))
-        if col == 0 or col > 4:
+        if col == 0 or col > n_cols:
             return block
         if row == 0:
             value = header[col - 1] if col - 1 < len(header) else ""
