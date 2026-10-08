@@ -9,6 +9,8 @@ raw/ 의 HWPX 템플릿 + 엑셀 표를 읽어, 서식을 그대로 둔 채 내�
   - "□ 주요 내용" 아래, 라벨이 자유로운 "ㅇ (라벨) 내용" 줄 1개 이상
   - 표 제목, 표 본문(1열은 순번 자동, 그 뒤는 엑셀의 '순번' 다음 열 전부) — 엑셀의 열 개수만큼 표 열이,
     데이터 행 수만큼 표 행이 늘거나 줄어듦(표 전체 너비는 유지한 채 열 너비만 다시 균등하게 나눔)
+  - 표의 모든 셀은 "한 줄로 입력"(SQUEEZE)으로 고정하고, 데이터가 ONE_PAGE_MAX_DATA_ROWS(15)행을
+    넘어 2페이지 이상 이어지면 표의 "글자처럼 취급"을 해제해 고정 위치에 띄움(1페이지 안에서 끝나면 유지)
   - "참고1" 아래 참고자료 제목 칸 (참고 내용이 없으면 이 문단 전체를 삭제)
 """
 import re
@@ -301,6 +303,31 @@ def adjust_table_cols(xml_text: str, target_data_cols: int) -> str:
     return xml_text[: m.start()] + new_tbl_block + xml_text[m.end() :]
 
 
+ONE_PAGE_MAX_DATA_ROWS = 15  # 이 템플릿 기준 실측값: 데이터 15행까지는 1페이지, 16행부터 2페이지로 넘어감
+
+
+def _apply_table_squeeze(xml_text: str) -> str:
+    """메인 표의 모든 셀을 "한 줄로 입력"(글자 간격을 줄여 한 줄에 맞춤)으로 바꾼다."""
+    m = re.search(rf'<hp:tbl id="{MAIN_TABLE_ID}".*?</hp:tbl>', xml_text, re.DOTALL)
+    if m is None:
+        raise ValueError(f"표(id={MAIN_TABLE_ID})를 찾지 못함")
+    tbl_block = m.group(0).replace('lineWrap="BREAK"', 'lineWrap="SQUEEZE"')
+    return xml_text[: m.start()] + tbl_block + xml_text[m.end() :]
+
+
+def _set_table_treat_as_char(xml_text: str, treat_as_char: bool) -> str:
+    """표가 ONE_PAGE_MAX_DATA_ROWS를 넘어 2페이지 이상으로 이어지면 "글자처럼 취급"을 해제해
+    고정된 위치에 띄운다(위치는 지금 자리 그대로 — vertRelTo/horzRelTo/offset은 그대로 두고
+    treatAsChar만 바꾼다). 1페이지 안에서 끝나면 "글자처럼 취급"을 그대로 유지한다."""
+    m = re.search(rf'<hp:tbl id="{MAIN_TABLE_ID}".*?</hp:tbl>', xml_text, re.DOTALL)
+    if m is None:
+        raise ValueError(f"표(id={MAIN_TABLE_ID})를 찾지 못함")
+    tbl_block = m.group(0)
+    value = "1" if treat_as_char else "0"
+    new_tbl_block = re.sub(r'(<hp:pos treatAsChar=")\d+(")', rf"\g<1>{value}\g<2>", tbl_block, count=1)
+    return xml_text[: m.start()] + new_tbl_block + xml_text[m.end() :]
+
+
 def _set_row_number_cell(data_row_xml: str, number: int) -> str:
     """표 데이터 행의 1열(순번) 칸 숫자를 바꾼다."""
     m = re.search(r"<hp:tc[ >].*?</hp:tc>", data_row_xml, re.DOTALL)
@@ -392,6 +419,8 @@ def fill_section0(xml_text: str, content: dict) -> str:
     n_cols = len(header)
     xml_text = adjust_table_cols(xml_text, n_cols)
     xml_text = adjust_table_rows(xml_text, len(data_rows))
+    xml_text = _apply_table_squeeze(xml_text)
+    xml_text = _set_table_treat_as_char(xml_text, treat_as_char=len(data_rows) <= ONE_PAGE_MAX_DATA_ROWS)
 
     def fill_cell(match: "re.Match", value: str) -> str:
         block = match.group(0)
