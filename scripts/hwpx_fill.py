@@ -140,10 +140,11 @@ KOREAN_WEEKDAYS = ["월", "화", "수", "목", "금", "토", "일"]
 
 
 def format_date_org(org: str = "대외협력실", when: date | None = None) -> str:
-    """'yy.m.d.(요일), 기관' 형식의 날짜·기관 줄을 오늘 날짜로 만든다."""
+    """'‘yy.m.d.(요일), 기관' 형식의 날짜·기관 줄을 오늘 날짜로 만든다.
+    연도 앞 ‘ 는 템플릿('‘26.10.7.(수)')과 같은 문자를 쓴다."""
     when = when or date.today()
     weekday = KOREAN_WEEKDAYS[when.weekday()]
-    return f"{when.strftime('%y')}.{when.month}.{when.day}.({weekday}), {org}"
+    return f"‘{when.strftime('%y')}.{when.month}.{when.day}.({weekday}), {org}"
 
 
 def _top_level_paragraph_spans(xml_text: str) -> list:
@@ -172,6 +173,20 @@ def _find_paragraph_span(xml_text: str, contains: str) -> tuple:
     raise ValueError(f"문단을 찾지 못함: {contains!r}")
 
 
+def _strip_trailing_blank_paragraphs(xml_text: str) -> str:
+    """문서 맨 끝의 빈 최상위 문단(글자·표·도형이 없는 줄)을 모두 지운다.
+    표나 참고1을 빼면 그 앞뒤에 있던 빈 줄이 끝에 남아 빈 공간이 생기기 때문."""
+    spans = _top_level_paragraph_spans(xml_text)
+    while len(spans) > 1:
+        start, end = spans[-1]
+        block = xml_text[start:end]
+        if re.search(r"<hp:t>[^<]*\S", block) or re.search(r"<hp:(tbl|ctrl|pic|rect|secPr)\b", block):
+            break
+        xml_text = xml_text[:start] + xml_text[end:]
+        spans.pop()
+    return xml_text
+
+
 def remove_top_level_paragraph(xml_text: str, contains: str) -> str:
     """최상위 문단(hp:p) 중 contains 문자열을 포함하는 문단을 통째로 지운다."""
     start, end = _find_paragraph_span(xml_text, contains)
@@ -194,6 +209,8 @@ def _set_last_t_text(block: str, new_text: str) -> str:
 
 def _bullet_paragraph(stamp: str, label: str, text: str) -> str:
     """"ㅇ (라벨) 내용" 한 줄(깊이 1)을 stamp(기존 ㅇ 문단)에서 서식을 그대로 복제해 만든다."""
+    if not label:
+        return _set_first_t_text(stamp, f" ㅇ {text}".rstrip())
     new_text = f" ㅇ ({label}) {text}".rstrip() if text else f" ㅇ ({label})"
     return _set_first_t_text(stamp, new_text)
 
@@ -368,11 +385,14 @@ def fill_section0(xml_text: str, content: dict) -> str:
 
     content 형식:
       title, date_org(없으면 오늘 날짜), table_caption, ref_title(없으면 "참고1" 문단 삭제)
+      sections: [{"heading": "목적", "items": [...]}, ...] — 원문의 "ㅁ 제목"마다 "□ 제목" 섹션 하나.
+        개수·이름 모두 원문 그대로. 주면 아래 overview_items/main_items 대신 이것을 쓴다.
       overview_items: "□ 추진 개요" 아래에 들어갈 ㅇ/-/* 줄 목록 (문서에 나오는 순서 그대로)
       main_items:     "□ 주요 내용" 아래에 들어갈 ㅇ/-/* 줄 목록 (라벨 자유, 1개 이상)
       각 줄은 {"depth": 1|2|3, "label": str(깊이1=ㅇ일 때만), "text": str} 형태.
       depth 1=ㅇ, 2=-, 3=*. 중간 단계를 생략해도(예: ㅇ 다음에 바로 depth 3) 순서대로 넣으면 된다.
       table_header, table_rows: 표에 채울 데이터 (열 개수·행 수 모두 데이터에 맞춰 표가 늘어나거나 줄어듦)
+        — table_header가 비어 있으면 표 제목·표 문단을 통째로 지운다(엑셀 없이 한글파일만 만들 때)
     """
 
     ref_title = (content.get("ref_title") or "").strip()
@@ -389,22 +409,45 @@ def fill_section0(xml_text: str, content: dict) -> str:
     star_stamp = xml_text[star_start:star_end]
     stamps = {"bullet": bullet_stamp, "dash": dash_stamp, "star": star_stamp}
 
-    overview_items = content.get("overview_items") or []
-    purpose_span = _find_paragraph_span(xml_text, " ㅇ (목적) ")
-    new_region = render_outline(overview_items, stamps, spacer)
-    xml_text = xml_text[:bg_start] + new_region + xml_text[purpose_span[1]:]
+    # 원문의 "ㅁ 제목" 하나하나를 "□ 제목" 섹션으로 만든다. sections 가 없으면 예전 형식
+    # (overview_items → □ 추진 개요, main_items → □ 주요 내용)으로 두 섹션을 만든다.
+    sections = content.get("sections")
+    if not sections:
+        main_items = content.get("main_items") or [{"label": "내용", "text": content.get("content_summary", "")}]
+        sections = [
+            {"heading": "추진 개요", "items": content.get("overview_items") or []},
+            {"heading": "주요 내용", "items": main_items},
+        ]
 
-    # "□ 주요 내용" 아래 "ㅇ (내용)" 한 줄을, main_items 개요(ㅇ/-/* 트리)로 바꾼다.
-    main_items = content.get("main_items") or [{"label": "내용", "text": content.get("content_summary", "")}]
-    content_start, content_end = _find_paragraph_span(xml_text, " ㅇ (내용) ")
-    new_main = render_outline(main_items, stamps, spacer)
-    xml_text = xml_text[:content_start] + new_main + xml_text[content_end:]
+    # 템플릿의 "□ 추진 개요"(첫 섹션)·"□ 주요 내용"(두 번째부터) 문단을 제목 stamp로,
+    # 제목 바로 다음 빈 문단을 제목-본문 간격으로, "ㅇ (목적)" 다음 빈 문단을 섹션 사이 간격으로 쓴다.
+    spans = _top_level_paragraph_spans(xml_text)
+    first_head = _find_paragraph_span(xml_text, "□ 추진 개요")
+    next_head = _find_paragraph_span(xml_text, "□ 주요 내용")
+    purpose = _find_paragraph_span(xml_text, " ㅇ (목적) ")
+    content_end = _find_paragraph_span(xml_text, " ㅇ (내용) ")[1]
+    head_gap = spans[spans.index(next_head) + 1]
+    section_gap = spans[spans.index(purpose) + 1]
+    head_stamps = [xml_text[slice(*first_head)], xml_text[slice(*next_head)]]
+
+    parts = []
+    for i, section in enumerate(sections):
+        if i > 0:
+            parts.append(xml_text[slice(*section_gap)])
+        heading = _set_first_t_text(head_stamps[min(i, 1)], f"□ {section.get('heading', '')} ")
+        parts.append(heading + xml_text[slice(*head_gap)] + render_outline(section.get("items") or [], stamps, spacer))
+    xml_text = xml_text[: first_head[0]] + "".join(parts) + xml_text[content_end:]
+
+    header = content.get("table_header", [])
+    data_rows = content.get("table_rows", [])
+    has_table = bool(header)
 
     replacements = [
         ("보고자료 제목", _esc(content["title"])),
         ("‘26.10.7.(수), KIAT 대외협력실", _esc(content.get("date_org") or format_date_org())),
-        ("[표 제목]", _esc(content["table_caption"])),
     ]
+    if has_table:
+        replacements.append(("[표 제목]", _esc(content.get("table_caption", ""))))
     if ref_title:
         replacements.append((" 참고자료 제목", " " + _esc(ref_title)))
 
@@ -414,8 +457,17 @@ def fill_section0(xml_text: str, content: dict) -> str:
             raise ValueError(f"placeholder not found exactly once: {old!r} (count={count})")
         xml_text = xml_text.replace(old, new, 1)
 
-    header = content.get("table_header", [])
-    data_rows = content.get("table_rows", [])
+    if not has_table:
+        # 표를 넣지 않으면 표 제목 문단, 그 앞 빈 줄, 표 문단을 통째로 지운다.
+        cap_start, cap_end = _find_paragraph_span(xml_text, "[표 제목]")
+        tbl_start, tbl_end = _find_paragraph_span(xml_text, f'<hp:tbl id="{MAIN_TABLE_ID}"')
+        spans = _top_level_paragraph_spans(xml_text)
+        prev_start, prev_end = spans[spans.index((cap_start, cap_end)) - 1]
+        if re.search(r"<hp:t>[^<]*\S[^<]*</hp:t>", xml_text[prev_start:prev_end]) is None:
+            cap_start = prev_start
+        xml_text = xml_text[:cap_start] + xml_text[cap_end:tbl_start] + xml_text[tbl_end:]
+        return _strip_trailing_blank_paragraphs(xml_text)
+
     n_cols = len(header)
     xml_text = adjust_table_cols(xml_text, n_cols)
     xml_text = adjust_table_rows(xml_text, len(data_rows))
@@ -450,7 +502,7 @@ def fill_section0(xml_text: str, content: dict) -> str:
         return fill_cell(match, value)
 
     xml_text = re.sub(r"<hp:tc[ >].*?</hp:tc>", table_sub, xml_text, flags=re.DOTALL)
-    return xml_text
+    return _strip_trailing_blank_paragraphs(xml_text)
 
 
 def generate_hwpx(template_path: Path, out_path: Path, content: dict) -> None:
